@@ -3,6 +3,7 @@
 """
 KindleEar电子书基类，每本投递到kindle的书籍抽象为这里的一个类。
 可以继承BaseFeedBook类而实现自己的定制书籍。
+cdhigh <https://github.com/cdhigh>
 """
 import os, re, urllib, urlparse, imghdr, datetime, hashlib
 from urllib2 import *
@@ -43,9 +44,13 @@ class BaseFeedBook:
     # 如果不提供此图片，软件使用PIL生成一个，但是因为GAE不能使用ImageFont组件
     # 所以字体很小，而且不支持中文标题，使用中文会出错
     mastheadfile = DEFAULT_MASTHEAD
-
-    coverfile = DEFAULT_COVER #封面图片文件
-
+    
+    #封面图片文件，如果值为一个字符串，则对应到images目录下的文件
+    #如果需要在线获取封面或自己定制封面（比如加日期之类的），则可以自己写一个回调函数，无参数，返回图片的二进制数据（支持gif/jpg/png格式）
+    #回调函数需要定义为类方法（使用@classmethod装饰器）
+    #如果回调函数返回的不是图片或为None，则还是直接使用DEFAULT_COVER
+    coverfile = DEFAULT_COVER
+    
     keep_image = True #生成的MOBI是否需要图片
 
     #是否按星期投递，留空则每天投递，否则是一个星期字符串列表
@@ -274,21 +279,23 @@ class BaseFeedBook:
                             threshold = 86400*self.oldest_article #以天为单位
                         
                         if delta.days*86400+delta.seconds > threshold:
-                            self.log.info("Skip old article(%s): %s" % (updated.strftime('%Y-%m-%d %H:%M:%S'),e.link))
+                            self.log.info("Skip old article(%s): %s" % (updated.strftime('%Y-%m-%d %H:%M:%S'), e.link))
                             continue
-                            
+                    
+                    title = e.title if hasattr(e, 'title') else 'Untitled'
+                    
                     #支持HTTPS
                     if hasattr(e, 'link'):
                         if url.startswith('https://'):
                             urlfeed = e.link.replace('http://','https://')
                         else:
                             urlfeed = e.link
-
+                            
                         if urlfeed in urladded:
                             continue
                     else:
                         urlfeed = ''
-
+                    
                     desc = None
                     if isfulltext:
                         summary = e.summary if hasattr(e, 'summary') else None
@@ -306,11 +313,11 @@ class BaseFeedBook:
                             if not urlfeed:
                                 continue
                             else:
-                                self.log.warn('Fulltext feed item no has desc,link to webpage for article.(%s)' % e.title)
-                    urls.append((section, e.title, urlfeed, desc))
+                                self.log.warn('Fulltext feed item no has desc,link to webpage for article.(%s)' % title)
+                    urls.append((section, title, urlfeed, desc))
                     urladded.add(urlfeed)
             else:
-                self.log.warn('fetch rss failed(%s):%s'%(URLOpener.CodeMap(result.status_code), url))
+                self.log.warn('fetch rss failed(%s):%s' % (URLOpener.CodeMap(result.status_code), url))
                 
         return urls
 
@@ -522,7 +529,7 @@ class BaseFeedBook:
         #如果readability解析失败，则启用备用算法（不够好，但有全天候适应能力）
         body = soup.find('body')
         head = soup.find('head')
-        if len(body.contents) == 0:
+        if not body or len(body.contents) == 0:
             from simpleextract import simple_extract
             summary = simple_extract(content)
             soup = BeautifulSoup(summary, "lxml")
@@ -682,9 +689,11 @@ class BaseFeedBook:
         
         self.soupprocessex(soup)
 
-        #插入分享链接
+        #插入分享链接，如果有插入qrcode，则返回(imgName, imgContent)
         if user:
-            self.AppendShareLinksToArticle(soup, user, url)
+            qrimg = self.AppendShareLinksToArticle(soup, user, url)
+            if qrimg:
+                yield ('image/jpeg', url, qrimg[0], qrimg[1], None, None)
 
         content = unicode(soup)
 
@@ -882,10 +891,12 @@ class BaseFeedBook:
         
         self.soupprocessex(soup)
 
-        #插入分享链接
+        #插入分享链接，如果插入了qrcode，则返回(imgName, imgContent)
         if user:
-            self.AppendShareLinksToArticle(soup, user, url)
-
+            qrimg = self.AppendShareLinksToArticle(soup, user, url)
+            if qrimg:
+                yield ('image/jpeg', url, qrimg[0], qrimg[1], None, None)
+                
         content = unicode(soup)
 
         #提取文章内容的前面一部分做为摘要
@@ -958,16 +969,18 @@ class BaseFeedBook:
             part.save(partData, fmt) #, **info)
             imagesData.append(partData.getvalue())
             
-            #分图和分图重叠20个像素，保证一行字符只能能显示在其中一个分图中
+            #分图和分图重叠20个像素，保证一行字符能显示在其中一个分图中
             top = bottom - 20 if bottom < height else bottom
             
         return imagesData
-        
+    
+    #在文章末尾添加分享链接，如果文章末尾添加了网址的QRCODE，则此函数返回生成的图像(imgName, imgContent)，否则返回None
     def AppendShareLinksToArticle(self, soup, user, url):
-        #在文章末尾添加分享链接
         if not user or not soup:
-            return
+            return None
         FirstLink = True
+        qrimg = None
+        qrimgName = ''
         body = soup.html.body
         if user.evernote and user.evernote_mail:
             href = self.MakeShareLink('evernote', user, url, soup)
@@ -1045,10 +1058,24 @@ class BaseFeedBook:
             ashare = soup.new_tag('a', href=url)
             ashare.string = OPEN_IN_BROWSER
             body.append(ashare)
-
+        if user.qrcode:
+            import lib.qrcode as qr_code
+            if not FirstLink:
+                self.AppendSeperator(soup)
+            body.append(soup.new_tag('br'))
+            qrimgName = 'img%d.jpg' % self.imgindex
+            imgshare = soup.new_tag('img', src=qrimgName)
+            body.append(imgshare)
+            FirstLink = False
+            img = qr_code.make(url)
+            qrimg = StringIO()
+            img.save(qrimg, 'JPEG')
+        
+        return (qrimgName, qrimg.getvalue()) if qrimg else None
+        
     def MakeShareLink(self, sharetype, user, url, soup):
         " 生成保存内容或分享文章链接的KindleEar调用链接 "
-        if sharetype in ('evernote','wiz'):
+        if sharetype in ('evernote', 'wiz'):
             href = "%s/share?act=%s&u=%s&url=" % (DOMAIN, sharetype, user.name)
         elif sharetype == 'pocket':
             href = '%s/share?act=pocket&u=%s&h=%s&t=%s&url=' % (DOMAIN, user.name, (hashlib.md5(user.pocket_acc_token_hash or '').hexdigest()), 
@@ -1302,8 +1329,8 @@ def remove_beyond(tag, next):
             after = getattr(tag, next)
         tag = tag.parent
 
+#获取BeautifulSoup中的一个tag下面的所有字符串
 def string_of_tag(tag, normalize_whitespace=False):
-    #获取BeautifulSoup中的一个tag下面的所有字符串
     if not tag:
         return ''
     if isinstance(tag, basestring):
@@ -1321,9 +1348,17 @@ def string_of_tag(tag, normalize_whitespace=False):
         ans = re.sub(r'\s+', ' ', ans)
     return ans
 
+#将抓取的网页发到自己邮箱进行调试
 def debug_mail(content, name='page.html'):
-    #将抓取的网页发到自己邮箱进行调试
     from google.appengine.api import mail
     mail.send_mail(SRC_EMAIL, SRC_EMAIL, "KindleEar Debug", "KindlerEar",
     attachments=[(name, content),])
-    
+
+#抓取网页，发送到自己邮箱，用于调试目的
+def debug_fetch(url, name='page.html'):
+    if not name:
+        name = 'page.html'
+    opener = URLOpener()
+    result = opener.open(url)
+    if result.status_code == 200 and result.content:
+        debug_mail(result.content, name)
